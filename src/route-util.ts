@@ -7,13 +7,37 @@ export class RouteError extends Error {
   }
 }
 
-/** Reject cross-origin browser requests; same-origin and non-browser callers pass. */
+/** localhost, [::1] or any 127/8 address — the loopback set of DSH's own `/api` fence. */
+export function isLoopbackHostname(hostname: string): boolean {
+  if (hostname === 'localhost' || hostname === '[::1]') return true
+  const parts = hostname.split('.')
+  return parts.length === 4 && parts[0] === '127' && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255)
+}
+
+/**
+ * Browser-trust fence modeled on DSH's `isTrustedApiRequest`: the Host must
+ * be loopback (defeats DNS rebinding), `Sec-Fetch-Site: cross-site` is
+ * refused, and an attached Origin must name the same host.
+ */
 export function assertSameOrigin(req: IncomingMessage): void {
-  const origin = req.headers.origin
   const host = req.headers.host
-  if (origin !== undefined && host !== undefined && origin !== `http://${host}` && origin !== `https://${host}`) {
-    throw new RouteError(403, 'origin-rejected')
+  let hostUrl: URL | undefined
+  try {
+    hostUrl = host === undefined ? undefined : new URL(`http://${host}`)
+  } catch {
+    hostUrl = undefined
   }
+  if (hostUrl === undefined || !isLoopbackHostname(hostUrl.hostname)) throw new RouteError(403, 'host-rejected')
+  if (req.headers['sec-fetch-site'] === 'cross-site') throw new RouteError(403, 'cross-site')
+  const origin = req.headers.origin
+  if (origin === undefined) return
+  let originHost: string | undefined
+  try {
+    originHost = new URL(origin).host
+  } catch {
+    originHost = undefined
+  }
+  if (originHost !== hostUrl.host) throw new RouteError(403, 'origin-rejected')
 }
 
 export async function readJsonBody(req: IncomingMessage, maxBytes: number): Promise<Record<string, unknown>> {

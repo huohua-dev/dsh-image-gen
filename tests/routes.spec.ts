@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { existsSync, rmSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import type { AddressInfo } from 'node:net'
@@ -13,7 +13,7 @@ import type { PluginServices } from '../src/services.js'
 import { SettingsStore } from '../src/settings-store.js'
 import { providerDigest } from '../src/index.js'
 import { defaultSettings } from '../src/shared.js'
-import { json, png, PNG, scriptedFetch } from './helpers.js'
+import { headersOf, json, png, PNG, scriptedFetch } from './helpers.js'
 
 let dir: string
 let server: Server
@@ -91,6 +91,100 @@ describe('routes', () => {
   it('rejects cross-origin writes', async () => {
     const response = await post('/key', { providerId: 'modelscope', key: 'k' }, { origin: 'https://evil.example' })
     expect(response.status).toBe(403)
+  })
+
+  it('refuses non-loopback Host headers and cross-site fetches before touching keys', async () => {
+    const raw = (headers: Record<string, string>): Promise<number> => new Promise((resolve, reject) => {
+      const body = JSON.stringify({ providerId: 'modelscope', key: 'attacker-key' })
+      const url = new URL(base + '/key')
+      const request = httpRequest({ host: url.hostname, port: url.port, path: '/key', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)), ...headers } }, response => {
+        response.resume()
+        resolve(response.statusCode ?? 0)
+      })
+      request.on('error', reject)
+      request.end(body)
+    })
+    expect(await raw({ host: 'rebind.evil.example' })).toBe(403)
+    expect(await raw({ host: `127.0.0.1:${new URL(base).port}`, 'sec-fetch-site': 'cross-site' })).toBe(403)
+    expect(await services.keys.get('modelscope')).toBeUndefined()
+    expect(await raw({ host: `localhost:${new URL(base).port}` })).toBe(200)
+  })
+
+  it('never sends a stored key to a draft endpoint or protocol it was not saved for', async () => {
+    await post('/key', { providerId: 'modelscope', key: 'ms-key-123456' })
+    const stored = defaultSettings().providers.find(entry => entry.id === 'modelscope')!
+    const evil = { ...stored, baseURL: 'https://collector.evil.example/v1' }
+    for (const path of ['/test', '/models']) {
+      const refused = await post(path, { providerId: 'modelscope', entry: evil })
+      expect(refused.status, path).toBe(400)
+      expect(refused.body.error).toMatch(/API Key/)
+    }
+    // providerId and entry.id disagreeing must not route around the check.
+    expect((await post('/test', { providerId: 'nonexistent', entry: evil })).status).toBe(400)
+    expect(net.calls.some(call => call.url.includes('evil.example'))).toBe(false)
+    // A key typed into the form may go to the draft endpoint.
+    const typed = await post('/test', { providerId: 'modelscope', entry: evil, key: 'typed-key' })
+    expect(typed.body).toMatchObject({ ok: true })
+    expect(headersOf(net.calls.at(-1)).authorization).toBe('Bearer typed-key')
+    // The saved endpoint keeps using the saved key.
+    expect((await post('/test', { providerId: 'modelscope', entry: stored })).body).toMatchObject({ ok: true })
+    expect(headersOf(net.calls.at(-1)).authorization).toBe('Bearer ms-key-123456')
+    expect(net.calls.at(-1)?.url).toContain('api-inference.modelscope.cn')
+  })
+
+  it('refuses the stored key when only the protocol of a draft changes', async () => {
+    const next = defaultSettings()
+    next.providers.push({ id: 'custom-1', name: 'Relay', protocol: 'openai-compat', baseURL: 'https://relay.example/v1', models: ['m'], defaultModel: 'm', enabled: true, proxy: { mode: 'inherit' } })
+    await post('/settings', { settings: next })
+    await post('/key', { providerId: 'custom-1', key: 'relay-key' })
+    const draft = { ...next.providers.at(-1)!, protocol: 'gemini' }
+    expect((await post('/models', { providerId: 'custom-1', entry: draft })).status).toBe(400)
+    expect(net.calls.some(call => headersOf(call)['x-goog-api-key'] === 'relay-key')).toBe(false)
+  })
+
+  it('clears the stored key of a provider whose saved baseURL or protocol changes', async () => {
+    const next = defaultSettings()
+    next.providers.push({ id: 'custom-1', name: 'Relay', protocol: 'openai-compat', baseURL: 'https://relay.example/v1', models: ['m'], defaultModel: 'm', enabled: true, proxy: { mode: 'inherit' } })
+    await post('/settings', { settings: next })
+    for (const id of ['modelscope', 'siliconflow', 'custom-1']) await post('/key', { providerId: id, key: `${id}-key` })
+    const configured = (view: { providers: Array<{ id: string; keyConfigured: boolean }> }, id: string): boolean | undefined => view.providers.find(entry => entry.id === id)?.keyConfigured
+
+    // Saving without endpoint changes keeps every key.
+    const same = await post('/settings', { settings: { ...next, chatTools: false } })
+    expect(['modelscope', 'siliconflow', 'custom-1'].map(id => configured(same.body, id))).toEqual([true, true, true])
+
+    // An invalid save changes nothing, keys included.
+    const invalid = structuredClone(next)
+    invalid.providers.find(entry => entry.id === 'modelscope')!.baseURL = 'https://collector.evil.example/v1'
+    invalid.proxy = { mode: 'custom', enabled: true, url: 'nonsense', noProxy: [] }
+    expect((await post('/settings', { settings: invalid })).status).toBe(400)
+    expect(await services.keys.get('modelscope')).toBe('modelscope-key')
+
+    // baseURL of a preset and protocol of a custom provider change: both keys go.
+    const changed = structuredClone(next)
+    changed.providers.find(entry => entry.id === 'modelscope')!.baseURL = 'https://collector.evil.example/v1'
+    changed.providers.find(entry => entry.id === 'custom-1')!.protocol = 'gemini'
+    const saved = await post('/settings', { settings: changed })
+    expect(saved.status).toBe(200)
+    expect(['modelscope', 'siliconflow', 'custom-1'].map(id => configured(saved.body, id))).toEqual([false, true, false])
+    expect(await services.keys.get('modelscope')).toBeUndefined()
+    expect(await services.keys.get('custom-1')).toBeUndefined()
+    expect(await services.keys.get('siliconflow')).toBe('siliconflow-key')
+  })
+
+  it('does not hand a leftover key to a provider re-added under the same id', async () => {
+    const next = defaultSettings()
+    next.providers.push({ id: 'custom-1', name: 'Relay', protocol: 'openai-compat', baseURL: 'https://relay.example/v1', models: ['m'], defaultModel: 'm', enabled: true, proxy: { mode: 'inherit' } })
+    await post('/settings', { settings: next })
+    await post('/key', { providerId: 'custom-1', key: 'relay-key' })
+    // Delete the provider (its key record stays behind), then re-add it elsewhere.
+    await post('/settings', { settings: defaultSettings() })
+    const readded = structuredClone(next)
+    readded.providers.at(-1)!.baseURL = 'https://collector.evil.example/v1'
+    expect((await post('/test', { providerId: 'custom-1', entry: readded.providers.at(-1) })).status).toBe(400)
+    const saved = await post('/settings', { settings: readded })
+    expect(saved.body.providers.find((entry: { id: string }) => entry.id === 'custom-1').keyConfigured).toBe(false)
+    expect(await services.keys.get('custom-1')).toBeUndefined()
   })
 
   it('tests connections and fetches image models', async () => {

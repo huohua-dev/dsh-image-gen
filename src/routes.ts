@@ -12,7 +12,7 @@ import { fileExists, isInside, openFolder, removeImageCopy, revealInFileManager 
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { generateAndStore, imageDir, saveImageCopy, settingsView, toAttachmentJson, type PluginServices } from './services.js'
-import { normalizeSettings, requireProvider } from './settings-store.js'
+import { normalizeSettings, requireProvider, validateSettings } from './settings-store.js'
 import { capabilitiesOf, effectiveModel, type GlobalProxy, type ProviderEntry } from './shared.js'
 import { redactSecrets } from './redact.js'
 
@@ -58,6 +58,21 @@ export function settingsRoute(services: PluginServices) {
   return jsonRoute(['GET', 'POST'], async req => {
     if (req.method === 'POST') {
       const body = await readJsonBody(req, SMALL_BODY)
+      // A provider whose endpoint changes (or whose id is new) loses its stored
+      // key, so a rewritten baseURL can never receive the old one. Validate
+      // first and clear before saving: a failed clear must not leave the new
+      // endpoint saved next to the old key.
+      const previous = await services.settings.get()
+      const next = normalizeSettings(body.settings)
+      const problems = validateSettings(next)
+      if (problems.length > 0) throw new RouteError(400, problems.join('；'))
+      for (const entry of next.providers) {
+        if (sameEndpoint(previous.providers.find(candidate => candidate.id === entry.id), entry)) continue
+        if (await services.keys.get(entry.id) === undefined) continue
+        await services.keys.unset(entry.id)
+        // The layered store swallows credential-store failures on unset; confirm.
+        if (await services.keys.get(entry.id) !== undefined) throw new RouteError(500, `${entry.name}：端点已改动，但旧 API Key 清除失败，设置未保存`)
+      }
       try {
         await services.settings.save(body.settings)
       } catch (error) {
@@ -145,8 +160,17 @@ async function draftEntry(services: PluginServices, body: Record<string, unknown
   if (entry === undefined) throw new RouteError(404, 'unknown-provider')
   const proxy = body.proxy === undefined ? settings.proxy : normalizeSettings({ proxy: body.proxy }).proxy
   const draftKey = str(body.key)?.trim()
-  const key = draftKey !== undefined && draftKey.length > 0 ? draftKey : await services.keys.get(entry.id)
-  return { entry, proxy, key }
+  if (draftKey !== undefined && draftKey.length > 0) return { entry, proxy, key: draftKey }
+  // A stored key only ever goes to the endpoint it was saved for.
+  if (!sameEndpoint(settings.providers.find(candidate => candidate.id === entry.id), entry)) {
+    throw new RouteError(400, '端点 Base URL 或协议与已保存的不一致：已保存的 API Key 不会发往新端点，请在 API Key 栏填写 Key 后再试')
+  }
+  return { entry, proxy, key: await services.keys.get(entry.id) }
+}
+
+/** Whether `next` still talks to the endpoint `stored` was keyed for. */
+function sameEndpoint(stored: Pick<ProviderEntry, 'baseURL' | 'protocol'> | undefined, next: Pick<ProviderEntry, 'baseURL' | 'protocol'>): boolean {
+  return stored !== undefined && stored.baseURL === next.baseURL && stored.protocol === next.protocol
 }
 
 async function listModels(fetcher: FetchLike, entry: ProviderEntry, key: string | undefined, signal: AbortSignal): Promise<{ status: number; ids: string[]; text: string }> {

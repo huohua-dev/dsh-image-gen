@@ -285,6 +285,7 @@ export function SettingsPanel({ t, onSaved }: { t: Translate; onSaved?: (view: S
             <label className="dig-label" htmlFor="dig-base">{t('baseURL')}</label>
             <input id="dig-base" className="dig-input" placeholder="https://" value={entry.baseURL} onChange={event => patchEntry({ baseURL: event.target.value })} />
             <span className="dig-hint">{entry.protocol === 'gemini' ? t('baseURLHintGemini') : t('baseURLHint')}</span>
+            {keyConfigured && view.providers.some(saved => saved.id === entry.id && (saved.baseURL !== entry.baseURL.trim() || saved.protocol !== entry.protocol)) && <div className="dig-notice dig-notice-warn">{t('keyResetOnSave')}</div>}
           </div>
           <div className="dig-field">
             <label className="dig-label" htmlFor="dig-key">{t('apiKey')}</label>
